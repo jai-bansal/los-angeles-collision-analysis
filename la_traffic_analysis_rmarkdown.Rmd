@@ -1,0 +1,1361 @@
+---
+title: 'Acorn Data Challenge: LA Traffic Collisions'
+author: "Jai Bansal"
+date: ""
+output: 
+  html_document:
+    code_folding: "hide"
+    toc: true
+    toc_float: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(echo = T, warning = F, message = F)
+
+```
+
+```{r more_setup, include = F}
+
+devtools::install_github("dkahle/ggmap")
+pacman::p_load(RSocrata, feather, skimr, dplyr, corrplot, tidyr, ggplot2, lubridate,        # Libraries
+               devtools, ggmap, readr, forecast, knitr, kableExtra)
+register_google(key = Sys.getenv("GOOGLE_KEY"))
+data = read_feather("la_traffic_collision_data.feather") # Import data
+
+```
+
+```{r initial_data_prep}
+
+data_clean = data %>% 
+                select(-c(crm_cd_desc, crm_cd)) %>%               # These fields have only 1 value
+      
+                mutate(dr_no = as.character(dr_no),               # These fields are not really numeric
+                       area = as.character(area), 
+                       rpt_dist_no = as.character(rpt_dist_no), 
+                       premis_cd = as.character(premis_cd), 
+                       
+                       location = toupper(gsub(" +", " ", location)),           # Remove extra spaces and make sure
+                       cross_street = toupper(gsub(" +", " ", cross_street)),   # fields are upper case
+                       
+                       location_1 = gsub("\n,  \n\\(", "", location_1),   # Get latitude, longitude
+                       location_1 = gsub(")", "", location_1), 
+                       lat = substr(location_1, start = 1, stop = as.numeric(gregexpr(",", location_1)) - 1), 
+                       lon = substr(location_1, start = as.numeric(gregexpr(",", location_1)) + 1, 
+                                    stop = nchar(location_1)), 
+                       lat = as.numeric(lat), 
+                       lon = as.numeric(lon))      
+
+```
+
+This document contains results of the LA Traffic Collisions data analysis.  
+
+<br>   
+
+### Key Questions
+
+Here are the key questions I'm interested in: 
+
+* How do traffic collision patterns vary by time of day, day of week, and time of year?   
+* How are traffic collisions distributed geographically? Is it possible to identify high-risk intersections or areas?   
+* Is it possible to predict the number of collisions in a given time frame?   
+
+<br>   
+
+### Data
+
+The data set contains info on traffic collision incidents in Los Angeles from January 2010 - August 2019. The data is transcribed from original traffic reports that are typed on paper and so may have errors.   
+The data is maintained by the city of Los Angeles and is updated weekly.
+The data has `r nrow(data)` rows and `r ncol(data)` columns. More info can be found [here](https://data.lacity.org/A-Safe-City/Traffic-Collision-Data-from-2010-to-Present/d5tf-ez2w).   
+
+**Data Sample** (selected fields):
+
+```{r data_sample}
+
+data_clean %>% 
+  select(dr_no, date_occ, time_occ, area_name, vict_age, vict_sex, vict_descent, location_1) %>%
+  head(3) %>% 
+  kable %>% kable_styling()
+
+```
+
+<br>
+
+### Data Exploration
+
+First, I'll take a general look at some of these variables.   
+
+```{r vict_age_plot}
+
+ggplot(data = select(data_clean, vict_age), aes(x = vict_age)) + 
+      geom_histogram(binwidth = 1) + 
+      scale_x_continuous(breaks = seq(0, 100, 5)) +
+      labs(x = "Victim Age", y = "Count", title = "Histogram of Collisions by Victim Age")
+
+```
+
+* There are not many victims below age 15/16. 
+* Most collision victims are in their 20s. The number of collision victims generally decreases after age 30.   
+* 99 seems to be a catch-all age, perhaps because it's the maximum age recorded.   
+* There are also spikes at most multiples of 5 (25, 30, 35, 40, 45, 50, 55, 60). This suggests some ages are estimated and that identification isn't always used to file  collision reports.   
+* How are collisions with multiple victims dealth with?   
+* Update: I emailed the data set owner on 2019-08-30 about the question above...waiting to hear back.
+
+<br>
+```{r vict_sex_plot}
+
+data_clean %>%
+      group_by(vict_sex) %>% 
+      summarize(total = n()) %>% 
+      ungroup() %>% 
+      filter(!(vict_sex %in% c("", "H", "N"))) %>%
+      
+    ggplot(aes(x = vict_sex, y = total)) + 
+      geom_bar(stat = "identity") + 
+      labs(x = "Victim Sex", y = "Collisions", title = "Collisions by Victim Sex")
+
+```
+
+* Given that a collision occurred, the victim is much more likely to be male than female      
+* "X" represents unknown gender   
+
+<br>
+
+Below, I check earliest collision report date per *area*. Based on some of the plots later in the document, it seemed possible that certain areas weren't reporting for the entire data set.   
+
+```{r area_min_date}
+
+data %>% 
+    group_by(area) %>% summarize(min_date = min(date_occ)) %>% ungroup() %>% 
+    rename(Area = area, `Earliest Collision Report Date` = min_date) %>%
+    kable %>% kable_styling()
+
+```
+
+However, all *area* have data starting from the beginning of the reporting period. It is still possible that certain sections of an *area* were not reporting for the entire period.      
+    
+<br>
+
+### Outlier Analysis
+
+This section looks at the days with the lowest/highest number of collisions.
+
+```{r outlier_data}
+
+# Create data set with collision count per day
+  outliers = data_clean %>% 
+              filter(date_occ != "2019-08-17") %>%      # This day looks like it has partial results
+              group_by(date_occ) %>% summarize(daily_count = n()) %>% ungroup()
+
+```
+
+Here are the days with the lowest number of collisions:   
+
+```{r outlier_lowest}
+
+outliers %>% 
+  filter(daily_count < quantile(outliers$daily_count, 0.005)) %>% 
+
+  mutate(day = weekdays(date_occ), 
+         hypothesis = c("New Year", "Presidents Day", "Thanksgiving", "Thanksgiving", 
+                        "Christmas / New Year", "Presidents Day", "Thanksgiving", "Christmas", 
+                        "New Years", "MLK Day", "Thanksgiving", "Christmas", 
+                        "Christmas / New Year", "Christmas / New Year", "Random Sunday", 
+                        "MLK Day", "Christmas"), 
+         date_occ = as.character(date_occ))
+
+```
+
+* Most low-collision days occur around holidays and before early 2014. This reflects less people driving on holidays as well as the overall rise in collisions from 2014-2017.   
+
+Here are the days with the highest number of collisions:   
+
+```{r outlier_highest}
+
+outliers %>% 
+    filter(daily_count > quantile(outliers$daily_count, 0.995)) %>% 
+    mutate(day = weekdays(date_occ), 
+           date_occ = as.character(date_occ))
+
+```
+
+* Most high-collision days are normal Fridays that occur after 2015. Could there be other dynamic at play here?    
+<br>   
+
+#### Conclusions
+
+  * Most low-collision days are holidays before 2014. Most high-collision days are Fridays after 2014.   
+  * Why are only some holidays associated with low-collision days? For example, MLK Day often has a low number of collisions but Independence Day never does.   
+  * There's interesting variation within holidays periods. For example, Christmas/New Year 2011 contains 1 low-collision day, while the same period in 2013 contains 2.   
+  * Would it be interesting to look at weather for high-collision days?   
+  * It's interesting that holidays like 4th of July, Memorial Day, and Labor Day don't show up as low- or high-collision outliers.   
+  * Daylight Savings Time does **not** show up as any kind of outlier in any year. That surprised me.      
+  
+<br>   
+
+### Collision Patterns by Time
+
+This section looks at how traffic collision patterns vary by time of day, day of week, and time of year.
+<br>   
+
+
+Below are quantiles of the difference between the date a collision is reported vs. the date it occurred.   
+
+```{r gap_quantile_1}
+
+gap = data %>% mutate(gap = as.numeric(ymd(date_rptd) - ymd(date_occ)))
+quantile(gap$gap)
+
+```
+
+Most collisions are reported on the same day they occurred, however some are not reported for years! Could this be a data error?   
+Next, I'll look at these quantiles only for collisions **not** reported on the same day as occurrence.   
+
+```{r gap_quantile_2}
+
+quantile(filter(gap, gap > 0)$gap)
+
+```
+
+Even among accidents that are not reported the same day, most are reported the day after.   
+<br>   
+
+```{r daily_collisions}
+
+# Plot daily collisions for 1 year
+data_clean %>% 
+  filter(substr(date_occ, 1, 4) == "2018") %>%  # Limit to 2018
+  group_by(date_occ) %>% summarize(daily_total = n()) %>% ungroup() %>% 
+  
+  ggplot(aes(x = as.Date(date_occ), y = daily_total)) + 
+  geom_line() + geom_point() + 
+  scale_x_date(date_breaks = "1 month", date_labels = "%b") + 
+  ylim(0, 250) +
+  labs(x = "", y = "Daily Collisions", title = "2018 Daily Collisions")
+
+```
+
+* This plot shows daily collisions for 2018 only   
+* There are large variations in collisions per day   
+* Outliers don't seem to follow an obvious pattern, except for the lower number of collisions during Christmas/New Year   
+
+```{r daily_collisions_reported}
+
+# Plot daily collisions reported for 1 year
+# Decently different than collisions
+data_clean %>% 
+  filter(substr(date_rptd, 1, 4) == "2018") %>%  # Limit to 2018
+  group_by(date_rptd) %>% summarize(daily_total = n()) %>% ungroup() %>% 
+  
+  ggplot(aes(x = as.Date(date_rptd), y = daily_total)) + 
+  geom_line() + geom_point() + 
+  scale_x_date(date_breaks = "1 month", date_labels = "%b") + 
+  ylim(0, 250) +
+  labs(x = "", y = "Daily Collisions Reported", title = "2018 Daily Collisions Reported")
+
+```
+
+* This plot shows daily collisions **reported** for 2018 only and looks fairly different from the previous plot   
+* What's going on with the outlier that appears in April?!     
+* There may be other administrative dynamics in play for the date reported   
+
+```{r monthly_collisions_over_time}
+
+  data_clean %>% 
+      mutate(date_mod = ymd(paste0(substr(date_occ, 1, 7), "-01"))) %>%
+      group_by(date_mod) %>% 
+      summarize(month_total = n()) %>% 
+      ungroup() %>% 
+      filter(date_mod != ymd("2019-08-01")) %>%              # Throw out incomplete month
+      
+    ggplot(aes(x = date_mod, y = month_total, group = 1)) + 
+      geom_line() + geom_point() + 
+      expand_limits(y = 0) + 
+      labs(x = "", y = "Collisions", title = "Monthly Collisions")
+
+```
+
+* This plot shows monthly collisions for the full data set
+* Collisions were roughly constant from 2010-2014, rose from 2014 to 2017, and have been roughly constant since.    
+
+```{r monthly_collisions_reported_over_time}
+
+data_clean %>% 
+    mutate(date_mod = ymd(paste0(substr(date_rptd, 1, 7), "-01"))) %>%
+    group_by(date_mod) %>% summarize(month_total = n()) %>% ungroup() %>% 
+    filter(date_mod != ymd("2019-08-01")) %>%              # Throw out incomplete month
+    
+    ggplot(aes(x = date_mod, y = month_total, group = 1)) + 
+    geom_line() + geom_point() + 
+    ylim(0, 5300) + 
+    labs(x = "", y = "Collisions Reported", title = "Monthly Collisions Reported")
+
+```
+
+* This plot shows monthly collisions **reported** for the full data set
+* The overall trend is the same vs. actual date occurred      
+
+<br>
+```{r collisions_by_time_of_day}
+
+ ggplot(data = select(data_clean, time_occ), aes(x = time_occ)) + 
+    geom_histogram(binwidth = 50, color = "black") + 
+    scale_x_continuous(breaks = seq(0, 2400, 200)) +
+    labs(x = "Time Occurred (24 Hour Format)", y = "Count", title = "Collisions by Time of Day")
+
+```
+
+* Collisions are:      
+    + sharply increasing from 4/5am to 730/8am   
+    + decreasing from 730/8am to 830/9am   
+    + generally increasing from 830/9am to 6pm   
+    + Sharply decreasing from 8pm to 4/5am   
+    + at their dailly minimum at 4/5am
+    + at their daily maximum at 5/6pm   
+* These results likely mirror the number of vehicles on the road. It would be useful to have a measure of traffic density to allow analysis of collisions **per capita**  
+
+The data does **not** include a timestamp for when collisions were reported.   
+
+<br>
+```{r, collisions_by_day_of_week}
+
+data_clean %>% 
+    mutate(day = weekdays(date_occ)) %>% 
+    group_by(day) %>% 
+    summarize(day_total = n()) %>% 
+    ungroup() %>% 
+    
+    ggplot(aes(x = factor(day, levels = c("Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday")), 
+               y = day_total)) + 
+    geom_bar(stat = "identity") + 
+    labs(x = "", y = "Collisions", title = "Collisions by Day of Week")
+
+```
+
+* Collisions are:      
+    + increasing from Sunday to Friday, with a sharp increase from Thursday to Friday
+    + at their weekly minimum on Sundays
+    + at their weekly maximum on Fridays
+* Collisions are sharply higher on Fridays. End of the week is an obvious hypothesis. Any others?   
+
+```{r, collisions_reported_by_day_of_week}
+
+# Collisions reported by day of week.
+# Sunday still the lowest, Friday still the highest
+# Weekdays are higher and even now
+data_clean %>% 
+  mutate(day = weekdays(date_rptd)) %>% 
+  group_by(day) %>% 
+  summarize(day_total = n()) %>% 
+  ungroup() %>% 
+  
+  ggplot(aes(x = factor(day, levels = c("Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday")), 
+             y = day_total)) + 
+  geom_bar(stat = "identity") + 
+  ylim(0, 80000) +
+  labs(x = "", y = "Collisions Reported", title = "Collisions Reported by Day of Week")
+
+```
+
+* Collisions **reported** by day of week looks pretty different than actual collision occurrence   
+* Sunday still has the least collisions reported, Friday still has the most      
+* However, the weekdays are now pretty much even in terms of collisions reported.         
+
+<br>
+```{r collisions_by_month}
+
+data_clean %>% 
+    mutate(month = as.numeric(substr(date_occ, 6, 7))) %>% 
+    group_by(month) %>% 
+    summarize(month_total = n()) %>% 
+    ungroup() %>%
+    
+  ggplot(aes(x = month, y = month_total)) + 
+    geom_bar(stat = "identity") + 
+    scale_x_continuous(breaks = c(1:12)) +
+    labs(x = "Month", y = "Collisions", title = "Collisions by Month")
+
+```
+
+* Collisions are   
+    + highest in March   
+    + my first guess would have been Daylight Savings Time. However, none of the high-collision outliers occurred on this date.   
+    + Could Spring Break tourists be the reason?   
+    + generally constant from April to August   
+    + generally lower from September to February   
+* Collisions are lower in the colder months. One hypothesis is less tourists. Any others?
+
+```{r collisions_reported_by_month}
+
+# Collisions reported by month
+  # Very similar to collisions
+  data_clean %>% 
+    mutate(month = as.numeric(substr(date_rptd, 6, 7))) %>% 
+    group_by(month) %>% 
+    summarize(month_total = n()) %>% 
+    ungroup() %>%
+    
+    ggplot(aes(x = month, y = month_total)) + 
+    geom_bar(stat = "identity") + 
+    scale_x_continuous(breaks = c(1:12)) +
+    ylim(0, 45000) + 
+    labs(x = "Month", y = "Collisions Reported", title = "Collisions Reported by Month")
+
+```
+
+* Very similar to collisions per month   
+<br>   
+
+#### Conclusions   
+
+* There's large daily variation in the number of collisions and collisions reported.   
+* Collisions and collisions reported were roughly constant from 2010-2014, rose from 2014 to 2017, and have been roughly constant since.   
+* Collisions are least frequent in the early morning and most frequent in the evening.   
+* Collisions are least frequent on Sundays and most frequent on Fridays.   
+* Collisions are least frequent in September and November and most frequent in March.   
+* For certain time frames and granularity, collisions and collisions reported can vary substantially.   
+
+<br>   
+
+### Collision Patterns by Geography
+
+This section examines how traffic collisions are distributed geographically. It identifies high-risk areas and analyzes collisions geographically by daypart, weekpart, and time of year. I first plot the number of collisions per area.
+
+```{r area_plot}
+
+   data_clean %>% 
+      group_by(area_name) %>%
+      summarize(total = n()) %>%
+      ungroup() %>%
+      
+    ggplot(aes(x = reorder(area_name, -total), y = total)) + 
+      geom_bar(stat = "identity") + 
+      theme(axis.text.x = element_text(angle = 90)) +
+      labs(x = "", y = "Count", title = "Collision Count by Area")
+
+```
+
+* Some areas have substantially more collisions than others.           
+* This plot would be more informative with a measure of area size or traffic density  
+
+Next, I look at the most commonly occurring *location*, *cross_street*, and *location*/*cross_street* combinations.   
+These are broad metrics, but can still be useful.   
+
+```{r most_common_location}
+
+# Most commonly occurring "location"
+    data_clean %>% 
+      group_by(location) %>% summarize(count = n()) %>% ungroup() %>% 
+      mutate(percentage = round(100 * count / nrow(data_clean), 1)) %>%
+      arrange(-count) %>% 
+      head(10)
+
+```
+
+* As expected, this is a list of some of the longest and most used roads in Los Angeles.   
+* Generally, ~10% of collisions occur on these 10 roads.   
+* I'm surprised to not see major highways like I-10 and I-405 on this list. Maybe there are less collisions on highways due to lack of intersections?   
+
+```{r most_common_cross_street}
+
+# Most commonly occurring "cross_street"
+data_clean %>% 
+  group_by(cross_street) %>% summarize(count = n()) %>% ungroup() %>% 
+  mutate(percentage = round(100 * count / nrow(data_clean), 1)) %>%
+  arrange(-count) %>% 
+  head(10)
+
+```
+
+* ~5% of collisions don't have a listed *cross street*.   
+* Otherwise, this list also contains major LA streets (and has some of the same streets as the previous list)   
+
+```{r most_common_location_cross_street_combo}
+
+# Most commonly occurring "location" and "cross_street" combo
+data_clean %>% 
+  group_by(location, cross_street) %>% summarize(count = n()) %>% ungroup() %>% 
+  mutate(percentage = round(100 * count / nrow(data_clean), 2)) %>%
+  arrange(-count) %>% 
+  head(10)
+
+```
+
+* The intersections with the most collisions account for at most 0.05% of total collisions.   
+
+<br>   
+
+Next I map collisions. First, I create an overall map.   
+
+```{r overall_map}
+
+# Create version of data for mapping
+# Data is pretty cluttered so I do it for one year only
+data_map = data_clean %>% 
+            filter(substr(date_occ, 1, 4) == "2018" &   # 2018 only
+                   lat != 0 & lon != 0) %>%  # Remove rows where "lat" and "lon" are both 0
+            group_by(lat, lon) %>% summarize(count = n()) %>% ungroup()
+
+# Overall map
+    # Cluttered, not super useful. But shows the weird shape of Los Angeles
+    m = get_map(location = c(lon = mean(data_clean$lon), lat = mean(data_clean$lat)), 
+                zoom = 10, maptype = "roadmap", scale = 2)
+    ggmap(m) + geom_point(aes(x = lon, y = lat, alpha = count, color = count), data = data_map) + 
+      theme(axis.text = element_blank(), 
+            axis.ticks = element_blank()) + 
+      scale_alpha(guide = "none") +
+      scale_colour_gradient(low = "cornflowerblue", high = "red") +
+      labs(x = "", y = "", title = "Overall Map: 2018 Collisions", color = "Collisions")
+
+```
+
+* This plot is cluttered but shows the interesting shape of Los Angeles.   
+* Blue / Red points indicate coordinates with a low / high number of collisions.   
+* Coordinates with a low number of collisions (blue points) are rendered with low intensity and look faded.   
+* Even on this zoomed-out map, I can see high collision coordinates in the Valley and East/South LA.   
+
+To get a better view, I'll zoom in on some areas. Note that many of the maps below overlap.   
+
+```{r valley_map}
+
+# Valley
+m = get_map(location = c(lon = -118.47, lat = 34.3), 
+            zoom = 11, maptype = "roadmap", scale = 2)
+ggmap(m) + geom_point(aes(x = lon, y = lat, alpha = count, color = count), data = data_map) + 
+  theme(axis.text = element_blank(), 
+        axis.ticks = element_blank()) +
+  scale_alpha(guide = "none") +
+  scale_colour_gradient(low = "cornflowerblue", high = "red") +
+  labs(x = "", y = "", title = "The Valley: 2018 Collisions", color = "Collisions")
+
+```
+
+* Surprisingly, the Valley has many high-collision coordinates!   
+
+```{r east_la_map}
+
+# East LA
+      m = get_map(location = c(lon = -118.285, lat = 34.0407), 
+                  zoom = 12, maptype = "roadmap", scale = 2)
+      ggmap(m) + geom_point(aes(x = lon, y = lat, alpha = count, color = count), data = data_map) + 
+        theme(axis.text = element_blank(), 
+              axis.ticks = element_blank()) +
+        scale_alpha(guide = "none") +
+        scale_colour_gradient(low = "cornflowerblue", high = "red") +
+        labs(x = "", y = "", title = "East LA: 2018 Collisions", color = "Collisions")
+
+```
+
+* East LA also has many high and medium collision coordinates.      
+* As expected many high/medium collision coordinates appear to be at intersections.   
+
+```{r west_la_map}
+
+# Westside
+      m = get_map(location = c(lon = -118.415, lat = 34.0), 
+                  zoom = 12, maptype = "roadmap", scale = 2)
+      ggmap(m) + geom_point(aes(x = lon, y = lat, alpha = count, color = count), data = data_map) + 
+        theme(axis.text = element_blank(), 
+              axis.ticks = element_blank()) +
+        scale_alpha(guide = "none") +
+        scale_colour_gradient(low = "cornflowerblue", high = "red") +
+        labs(x = "", y = "", title = "West LA: 2018 Collisions", color = "Collisions")
+
+```
+
+* West LA clearly shows some areas that do not report data in 2018 and a few major collision coordinates.      
+* Note the high and medium collision coordinates in/around LAX.     
+
+```{r long_beach_map}
+
+# Long Beach
+m = get_map(location = c(lon = -118.2937, lat = 33.7901), 
+            zoom = 12, maptype = "roadmap", scale = 2)
+ggmap(m) + geom_point(aes(x = lon, y = lat, alpha = count, color = count), data = data_map) + 
+  theme(axis.text = element_blank(), 
+        axis.ticks = element_blank()) +
+  scale_alpha(guide = "none") +
+  scale_colour_gradient(low = "cornflowerblue", high = "red") +
+  labs(x = "", y = "", title = "Long Beach: 2018 Collisions", color = "Collisions")
+
+```
+
+* The Long Beach map mostly reflects the shape of Los Angeles.   
+* No high/medium collision coordinates.    
+
+Next, I take the most common collision daypart for each coordinate and plot. The dayparts I use are:   
+
+* Early Morning (4AM - 8AM)   
+* Late Morning (8AM - 12PM)   
+* Afternoon (12PM - 5PM)   
+* Evening (5PM - 10PM)   
+* Late Night (10PM - 4AM)   
+
+The overall map is cluttered, so I jump straight to area maps.   
+
+```{r valley_time_map}
+
+# Create version of data for mapping average accident time
+# Data is pretty cluttered so I do it for one year only
+data_map_time = data_clean %>% 
+                      filter(substr(date_occ, 1, 4) == "2018" &   # 2018 only
+                               lat != 0 & lon != 0) %>%           # Remove rows where "lat" and "lon" are both 0
+      
+                      mutate(daypart = case_when(time_occ >= 2200 | time_occ < 400 ~ "Late Night (10PM - 4AM)",      # Create dayparts
+                                                 time_occ >= 400 & time_occ < 800 ~ "Early Morning (4AM - 8AM)", 
+                                                 time_occ >= 800 & time_occ < 1200 ~ "Late Morning (8AM - 12PM)", 
+                                                 time_occ >= 1200 & time_occ < 1700 ~ "Afternoon (12PM - 5PM)", 
+                                                 TRUE ~ "Evening (5PM - 10PM)"), 
+                             
+                             daypart = factor(daypart, levels = c("Early Morning (4AM - 8AM)", "Late Morning (8AM - 12PM)", 
+                                                                  "Afternoon (12PM - 5PM)", "Evening (5PM - 10PM)", 
+                                                                  "Late Night (10PM - 4AM)"))) %>% 
+      
+                      group_by(lat, lon) %>% mutate(total = n()) %>% ungroup() %>%             # Total collisions per coordinate
+      
+                      group_by(lat, lon, total, daypart) %>% summarize(count = n()) %>% ungroup() %>%    # Count collisions per coordinate / daypart
+                      
+                      group_by(lat, lon) %>% mutate(max_val = max(count)) %>% ungroup() %>%      # Only keep max collision dayparts
+                      filter(count == max_val) %>% 
+      
+                      group_by(lat, lon) %>% mutate(row_count = n()) %>% ungroup() %>%    # Remove coordinates with equal collisions in 
+                      filter(row_count == 1)                                              # different dayparts. This could lose some big coordinates
+    
+
+# Create color scale
+    daypart_values = values = c("pink", "orange", "indianred1", "purple", "black")
+
+m = get_map(location = c(lon = -118.47, lat = 34.3), 
+                zoom = 11, maptype = "roadmap", scale = 2)
+    ggmap(m) + geom_point(aes(x = lon, y = lat, alpha = count, color = daypart), 
+                          data = filter(data_map_time, total >= 5)) + 
+      theme(axis.text = element_blank(), 
+            axis.ticks = element_blank()) +
+      scale_alpha(guide = "none") +
+      scale_color_manual(values = daypart_values) + 
+      facet_grid(cols = vars(daypart)) +
+      labs(x = "", y = "", title = "The Valley: 2018 Collisions by Daypart (Coordinates with 5+ Collisions)", color = "Most Common Daypart")
+
+```
+
+* The afternoon and evening dayparts are most common.   
+
+```{r east_la_time_map}
+
+m = get_map(location = c(lon = -118.285, lat = 34.0407), 
+                zoom = 12, maptype = "roadmap", scale = 2)
+    ggmap(m) + geom_point(aes(x = lon, y = lat, alpha = count, color = daypart), 
+                          data = filter(data_map_time, total >= 5)) + 
+      theme(axis.text = element_blank(), 
+            axis.ticks = element_blank()) +
+      scale_alpha(guide = "none") +
+      scale_color_manual(values = daypart_values) + 
+      facet_grid(cols = vars(daypart)) +
+      labs(x = "", y = "", title = "East LA: 2018 Collisions by Daypart (Coordinates with 5+ Collisions)", color = "Most Common Daypart")
+
+```
+
+* The afternoon and evening dayparts are most common.   
+
+```{r west_side_daypart}
+
+# Westside
+    m = get_map(location = c(lon = -118.415, lat = 34.0), 
+                zoom = 12, maptype = "roadmap", scale = 2)
+    ggmap(m) + geom_point(aes(x = lon, y = lat, alpha = count, color = daypart), 
+                          data = filter(data_map_time, total >= 5)) + 
+      theme(axis.text = element_blank(), 
+            axis.ticks = element_blank()) +
+      scale_alpha(guide = "none") +
+      scale_color_manual(values = daypart_values) + 
+      facet_grid(cols = vars(daypart)) +
+      labs(x = "", y = "", title = "West LA: 2018 Collisions by Daypart (Coordinates with 5+ Collisions)", color = "Most Common Daypart")
+    
+```
+
+* In west LA, it looks like the evening daypart is most common for collisions.  
+
+```{r long_beach_daypart}
+
+# Long Beach
+    m = get_map(location = c(lon = -118.2937, lat = 33.7901), 
+                zoom = 12, maptype = "roadmap", scale = 2)
+    ggmap(m) + geom_point(aes(x = lon, y = lat, alpha = count, color = daypart), 
+                          data = filter(data_map_time, total >= 5)) + 
+      theme(axis.text = element_blank(), 
+            axis.ticks = element_blank()) + 
+      scale_alpha(guide = "none") +
+      scale_color_manual(values = daypart_values) + 
+      facet_grid(cols = vars(daypart)) +
+      labs(x = "", y = "", title = "Long Beach: 2018 Collisions by Daypart (Coordinates with 5+ Collisions)", color = "Most Common Daypart")
+
+```
+
+* The afternoon and evening dayparts are most common.   
+
+Next, I look at whether collisions mostly occur on weekdays or weekends geographically.   
+
+```{r valley_weekpart}
+
+# Create version of data for mapping most common accident weekpart
+    # Data is pretty cluttered so I do it for one year only
+    data_map_week = data_clean %>% 
+      filter(substr(date_occ, 1, 4) == "2018" &   # 2018 only
+               lat != 0 & lon != 0) %>%           # Remove rows where "lat" and "lon" are both 0
+      
+      mutate(day = weekdays(date_occ), 
+             week_type = if_else(day %in% c("Saturday", "Sunday"), "Weekend", "Weekday")) %>% 
+      
+      group_by(lat, lon) %>% mutate(total = n()) %>% ungroup() %>%             # Total collisions per coordinate
+      
+      group_by(lat, lon, total, week_type) %>% summarize(count = n()) %>% ungroup() %>%    # Count collisions per coordinate / daypart
+      
+      group_by(lat, lon) %>% mutate(max_val = max(count)) %>% ungroup() %>%      # Only keep max collision dayparts
+      filter(count == max_val) %>% 
+      
+      group_by(lat, lon) %>% mutate(row_count = n()) %>% ungroup() %>%    # Remove coordinates with equal collisions in 
+      filter(row_count == 1)                                              # different dayparts. This could lose some big coordinates
+
+# Valley
+    m = get_map(location = c(lon = -118.47, lat = 34.3), 
+                zoom = 11, maptype = "roadmap", scale = 2)
+    ggmap(m) + geom_point(aes(x = lon, y = lat, alpha = count, color = week_type), data = filter(data_map_week, total >= 3)) + 
+      theme(axis.text = element_blank(), 
+            axis.ticks = element_blank()) +
+      scale_alpha(guide = "none") + 
+      facet_grid(cols = vars(week_type)) +
+      labs(x = "", y = "", title = "The Valley: 2018 Collisions by Weekpart (Coordinates with 3+ Collisions)", color = "Most Common Weekpart")
+
+```
+
+```{r east_la_weekpart}
+
+# East LA
+    m = get_map(location = c(lon = -118.285, lat = 34.0407), 
+                zoom = 12, maptype = "roadmap", scale = 2)
+    ggmap(m) + geom_point(aes(x = lon, y = lat, alpha = count, color = week_type), data = filter(data_map_week, total >= 3)) + 
+      theme(axis.text = element_blank(), 
+            axis.ticks = element_blank()) +
+      scale_alpha(guide = "none") + 
+      facet_grid(cols = vars(week_type)) +
+      labs(x = "", y = "", title = "East LA: 2018 Collisions by Weekpart (Coordinates with 3+ Collisions)", color = "Most Common Weekpart")
+
+```
+
+```{r west_la_weekpart}
+
+ m = get_map(location = c(lon = -118.415, lat = 34.0), 
+                zoom = 12, maptype = "roadmap", scale = 2)
+    ggmap(m) + geom_point(aes(x = lon, y = lat, alpha = count, color = week_type), data = filter(data_map_week, total >= 3)) + 
+      theme(axis.text = element_blank(), 
+            axis.ticks = element_blank()) +
+      scale_alpha(guide = "none") + 
+      facet_grid(cols = vars(week_type)) +
+      labs(x = "", y = "", title = "West LA: 2018 Collisions by Weekpart (Coordinates with 3+ Collisions)", color = "Most Common Weekpart")
+
+```
+
+```{r long_beach_weekpart}
+
+# Long Beach
+    m = get_map(location = c(lon = -118.2937, lat = 33.7901), 
+                zoom = 12, maptype = "roadmap", scale = 2)
+    ggmap(m) + geom_point(aes(x = lon, y = lat, alpha = count, color = week_type), data = filter(data_map_week, total >= 3)) + 
+      theme(axis.text = element_blank(), 
+            axis.ticks = element_blank()) + 
+      scale_alpha(guide = "none") + 
+      facet_grid(cols = vars(week_type)) +
+      labs(x = "", y = "", title = "Long Beach: 2018 Collisions by Weekpart (Coordinates with 3+ Collisions)", color = "Most Common Weekpart")
+
+```
+
+```{r valley_season}
+
+# Create version of data for mapping most common accident season
+    # Data is pretty cluttered so I do it for one year only
+    data_map_season = data_clean %>% 
+      filter(substr(date_occ, 1, 4) == "2018" &   # 2018 only
+               lat != 0 & lon != 0) %>%           # Remove rows where "lat" and "lon" are both 0
+      
+      mutate(month = as.numeric(substr(date_occ, 6, 7)), 
+             season = case_when(month %in% c(12, 1, 2) ~ "Dec-Feb", 
+                                month %in% c(3, 4, 5) ~ "Mar-May", 
+                                month %in% c(6, 7, 8) ~ "June-Aug", 
+                                TRUE ~ "Sep-Nov")) %>%
+      
+      group_by(lat, lon) %>% mutate(total = n()) %>% ungroup() %>%             # Total collisions per coordinate
+      
+      group_by(lat, lon, total, season) %>% summarize(count = n()) %>% ungroup() %>%    # Count collisions per coordinate / season
+      
+      group_by(lat, lon) %>% mutate(max_val = max(count)) %>% ungroup() %>%      # Only keep max collision dayparts
+      filter(count == max_val) %>% 
+      
+      group_by(lat, lon) %>% mutate(row_count = n()) %>% ungroup() %>%    # Remove coordinates with equal collisions in 
+      filter(row_count == 1)                                              # different dayparts. This could lose some big coordinates
+
+m = get_map(location = c(lon = -118.47, lat = 34.3), 
+                zoom = 11, maptype = "roadmap", scale = 2)
+    ggmap(m) + geom_point(aes(x = lon, y = lat, alpha = count, color = season), data = filter(data_map_season, total >= 3)) + 
+      theme(axis.text = element_blank(), 
+            axis.ticks = element_blank()) +
+      scale_alpha(guide = "none") + 
+      facet_grid(cols = vars(season)) + 
+      labs(x = "", y = "", title = "The Valley: 2018 Collisions by Season (Coordinates with 3+ Collisions)", color = "Most Common Season")
+
+```
+
+```{r east_la_season}
+
+m = get_map(location = c(lon = -118.285, lat = 34.0407), 
+                zoom = 12, maptype = "roadmap", scale = 2)
+    ggmap(m) + geom_point(aes(x = lon, y = lat, alpha = count, color = season), data = filter(data_map_season, total >= 3)) + 
+      theme(axis.text = element_blank(), 
+            axis.ticks = element_blank()) +
+      scale_alpha(guide = "none") + 
+      facet_grid(cols = vars(season)) + 
+      labs(x = "", y = "", title = "East LA: 2018 Collisions by Season (Coordinates with 3+ Collisions)", color = "Most Common Season")
+
+```
+
+```{r west_la_season}
+
+m = get_map(location = c(lon = -118.415, lat = 34.0), 
+                zoom = 12, maptype = "roadmap", scale = 2)
+    ggmap(m) + geom_point(aes(x = lon, y = lat, alpha = count, color = season), data = filter(data_map_season, total >= 3)) + 
+      theme(axis.text = element_blank(), 
+            axis.ticks = element_blank()) +
+      scale_alpha(guide = "none") + 
+      facet_grid(cols = vars(season)) + 
+      labs(x = "", y = "", title = "West LA: 2018 Collisions by Season (Coordinates with 3+ Collisions)", color = "Most Common Season")
+
+```
+
+```{r long_beach_season}
+
+# Long Beach
+    m = get_map(location = c(lon = -118.2937, lat = 33.7901), 
+                zoom = 12, maptype = "roadmap", scale = 2)
+    ggmap(m) + geom_point(aes(x = lon, y = lat, alpha = count, color = season), data = filter(data_map_season, total >= 3)) + 
+      theme(axis.text = element_blank(), 
+            axis.ticks = element_blank()) + 
+      scale_alpha(guide = "none") + 
+      facet_grid(cols = vars(season)) + 
+      labs(x = "", y = "", title = "Long Beach: 2018 Collisions by Season (Coordinates with 3+ Collisions)", color = "Most Common Season")
+
+```
+
+<br>   
+
+#### Conclusions   
+
+* ~5% of collisions don't have an associated *cross_street*.   
+* Through the *location* field, *cross_street* field, and mapping it's possible to identify the most accident-prone coordinates in Los Angeles.   
+* Most coordinates with the highest number of collisions are in the Valley, East LA, or South LA.   
+
+<br>   
+
+### Predictive Modeling
+
+This section explores predicting the number of collisions in a given time frame. Specifically, I predict the **number of collisions per month per area**.
+<br>   
+Let's see how this data looks for a given area.
+<br>   
+
+```{r model_sample_data}
+
+# Get data
+model_data = data_clean %>%
+              mutate(month = ymd(paste0(substr(date_occ, 1, 7), "-01"))) %>% # Create month variable 
+              filter(month != ymd("2019-08-01")) %>%                         # Throw out partial month
+              group_by(month, area) %>% summarize(collisions = n()) %>% ungroup()
+
+# Sample area plot
+ggplot(data = filter(model_data, area == 2), aes(x = month, y = collisions)) + 
+  geom_line() + geom_point() + 
+  expand_limits(y = 0) +
+  labs(x = "", y = "Monthly Collisions", title = "Monthly Collisions for Area 2")
+
+```
+
+* Area 2 reflects the same general trend as the overall data, where the number of collisions increases from 2014-2017.   
+
+<br>   
+
+Let's take a look at the decomposition for area 2.
+
+```{r decomp_area_2}
+
+# Sample area decomposition
+  ts(filter(model_data, area == 2)$collisions, frequency = 12) %>% decompose %>% autoplot(main = "Area 2 Decomposition")
+
+```
+
+* Decomposing fits a seasonality curve and trend, but with large remainders.   
+
+<br>   
+
+I'll also look at the decomposition for total monthly collisions (all areas).
+
+```{r decomp_all_areas}
+
+# All area decomposition
+  ts((data_clean %>% 
+    mutate(date_mod = ymd(paste0(substr(date_occ, 1, 7), "-01"))) %>%
+    group_by(date_mod) %>% summarize(month_total = n()) %>% ungroup() %>% 
+    filter(date_mod != ymd("2019-08-01")))$month_total, frequency = 12) %>% decompose %>% autoplot(main = "Overall Data Decomposition")
+
+```
+
+* The seasonality curve looks very different for all areas.   
+
+<br>   
+
+Next, I look at the ACF and PACF for area 2.
+
+```{r acf}
+
+ggAcf(filter(model_data, area == 2)$collisions) + labs(title = "ACF for Area 2")
+
+```
+
+* There is strong correlation with all lags shown on plot.   
+
+```{r pacf}
+
+ggPacf(filter(model_data, area == 2)$collisions) + labs(title = "PACF for Area 2")
+
+```
+
+* The first 2 lags are each explaining previously unexplained variance.   
+
+<br>   
+
+I'll try the following modeling approaches:
+
+* 3 and 6 month moving averages (MA)   
+* ARIMA   
+* Prophet library   
+
+MA models are the simplest time series method and average past values to generate a prediction. ARIMA models use past values, differencing, and previous errors. Prophet is an additive forecasting method where non-linear trends are fit with yearly, weekly, and daily (not in this case) seasonality. It can also support additional external regressors.   
+
+I evaluate each model on the final 12 months of data (August 2018 to July 2019) with the following metrics:      
+
+* mean absolute percentage error (MAPE): average absolute percentage difference between prediction and actual (never negative)   
+* bias: average percentage difference between prediction and actual   
+
+The MAPE tells me the average magnitude of model error, while the bias tells me if the model is systemically over- or under-predicting.  
+
+Let's look at the best ARIMA fit for area 2.
+
+```{r auto_arima_area_2}
+
+# Look at best p, q, d for ARIMA
+auto.arima(filter(model_data, area == 2)$collisions)
+
+```
+
+* This turns out to be the best fit for most, but **not** all, areas.   
+* I use the *auto.arima* function to fit the best ARIMA model to for each area.
+<br>   
+
+```{r import_preds, message = F}
+
+all_preds = read_csv("all_preds.csv")
+
+```
+
+After fitting the models, I want to look at some metrics. First, I'll look at the average MAPE and bias for each model.   
+
+```{r model_error_summary}
+
+# Table of mean overall performance per model
+    all_preds %>% summarize(mean_m3_mape = round(mean(m3_mape), 4), 
+                            mean_m6_mape = round(mean(m6_mape), 4), 
+                            mean_arima_mape = round(mean(arima_mape), 4),
+                            mean_prophet_mape = round(mean(prophet_mape), 4), 
+                            mean_m3_bias = round(mean(m3_bias), 4), 
+                            mean_m6_bias = round(mean(m6_bias), 4),
+                            mean_arima_bias = round(mean(arima_bias), 4),
+                            mean_prophet_bias = round(mean(prophet_bias), 4)) %>% 
+  data.frame()
+
+```
+
+* This table reflects:   
+    + Auto-fit ARIMA models for each area. So each area can have a different p, d, and q.   
+    + The best result of multiple Prophet model specifications.  
+* The 3 and 6 month MA models have very similar results.   
+* The ARIMA model has a similar MAPE to the MA models, but worse bias.   
+* The Prophet model has the worse results by far (even after tuning).   
+    
+Let's plot these results. First, I'll look at the actual collisions and model predictions for area 2.   
+
+```{r collisions_and_preds}
+
+all_preds = mutate(all_preds, area = as.character(area))
+
+# Look at data and preds for area 2
+  model_data %>% 
+    mutate(area = as.character(area)) %>% 
+    filter(area == 2 & month >= ymd("2018-05-01")) %>% 
+    left_join(select(all_preds, -c(collisions, m3_mape, m3_bias, m6_mape, m6_bias, arima_mape, arima_bias, prophet_mape, prophet_bias)), 
+              by = c("month", "area")) %>% 
+    rename(Actual = collisions, ARIMA = arima_pred, `3 Month MA` = m3_pred, `6 Month MA` = m6_pred, Prophet = prophet_pred) %>%
+    gather(cat, val, -c(month, area)) %>% 
+    mutate(cat = factor(cat, levels = c("3 Month MA", "6 Month MA", "ARIMA", "Prophet", "Actual"))) %>%
+  
+  ggplot(aes(x = month, y = val, group = cat, color = cat)) + 
+    geom_line() + geom_point() + 
+    scale_color_manual(values = c("#F8766D", "#7CAE00", "#00BFC4", "#C77CFF", "black")) +
+    expand_limits(y = 50) + 
+    scale_x_date(date_breaks = "1 month", date_labels = "%b-%y") + 
+    theme(axis.text.x = element_text(angle = 90)) +
+    labs(x = "", y = "", title = "Actual Collisions and Model Predictions for Area 2")
+
+```
+
+* The Prophet model has much higher predictions than other models for the first 5 months.   
+* All models miss the drop in Jan 2019.      
+* All models miss the up/down pattern of April 2019-July 2019.   
+* Most models have certain months where they are pretty much exactly right.   
+* The 6 month MA model predictions don't vary that much.
+<br>
+
+```{r mape_per_model_per_month}
+
+# Average MAPE per model per month
+    all_preds %>% 
+      group_by(month) %>% summarize(`3 Month MA` = mean(m3_mape), 
+                                    `6 Month MA` = mean(m6_mape), 
+                                    `ARIMA` = mean(arima_mape),
+                                    Prophet = mean(prophet_mape)) %>% ungroup() %>%
+      gather(key = "model", value = "error", -month) %>%
+      
+      ggplot(aes(x = month, y = error, group = model, color = model)) + 
+      geom_line() + geom_point() +
+      expand_limits(y = 0) + 
+      scale_x_date(date_breaks = "1 month", date_labels = "%b-%y") +
+      theme(axis.text.x = element_text(angle = 90)) +
+      labs(x = "", y = "MAPE", title = "Avg. Monthly MAPE for Validation Data", color = "Model")
+
+```
+
+* For many months, all models have similar predictions.   
+* Generally, the 6 month MA and ARIMA models move together.   
+
+```{r bias_per_model_per_month}
+
+# Average bias per model per month
+    # Moving average model biases tend to move together
+    # Prophet model seems to typically over-estimate
+    all_preds %>% 
+      group_by(month) %>% summarize(`3 Month MA` = mean(m3_bias), 
+                                    `6 Month MA` = mean(m6_bias), 
+                                    `ARIMA` = mean(arima_bias),
+                                    Prophet = mean(prophet_bias)) %>% ungroup() %>%
+      gather(key = "model", value = "error", -month) %>% 
+      
+      ggplot(aes(x = month, y = error, group = model, color = model)) + 
+      geom_line() + geom_point() + 
+      ylim(-0.1, 0.15) +
+      scale_x_date(date_breaks = "1 month", date_labels = "%b-%y") + 
+      theme(axis.text.x = element_text(angle = 90)) +
+      labs(x = "", y = "Bias", title = "Avg. Monthly Bias for Validation Data", color = "Model")
+
+```
+
+* Both MA and the ARIMA models move together. The swings represent data fluctuations while predictions stayed relatively constant.      
+* Prophet overpredicts for entire validation set!   
+
+```{r mape_per_model_per_area}
+
+# Average MAPE per model per area
+    # Chaotic but...
+    # Varying MAPEs by "area"
+    # Interesting edge cases where Prophet model is the only one that sucks ("area" 12)
+    # Or where only 3 and 6 month MA model suck ("area" 8)
+    all_preds %>% 
+      group_by(area) %>% summarize(`3 Month MA` = mean(m3_mape), 
+                                   `6 Month MA` = mean(m6_mape), 
+                                   `ARIMA` = mean(arima_mape),
+                                   Prophet = mean(prophet_mape)) %>% ungroup() %>% 
+      gather(key = "model", value = "error", -area) %>%
+      
+      ggplot(aes(x = as.numeric(area), y = error, fill = model)) + 
+      geom_bar(position = "dodge", stat = "identity") + 
+      scale_x_continuous(breaks = 1:21) +
+      labs(x = "Area", y = "MAPE", title = "Avg. Area MAPE for Validation Data", fill = "Model")
+
+```
+
+* Chaotic, but model MAPE varies significantly by area.   
+
+```{r bias_per_model_per_area}
+
+# Average bias per model per area
+    # Chaotic but...
+    # Varying biases by "area"
+    # Interesting edge cases...
+    # Area 1, Prophet has positive bias, no other model does
+    # Area 17, 3 month MA has negative bias, no other model does
+    # Looks like Prophet model really stinks when it comes to bias
+    all_preds %>% 
+      group_by(area) %>% summarize(`3 Month MA` = mean(m3_bias), 
+                                   `6 Month MA` = mean(m6_bias), 
+                                   `ARIMA` = mean(arima_bias),
+                                   Prophet = mean(prophet_bias)) %>% ungroup() %>% 
+      gather(key = "model", value = "error", -area) %>%
+      
+      ggplot(aes(x = as.numeric(area), y = error, fill = model)) + 
+      geom_bar(position = "dodge", stat = "identity") + 
+      scale_x_continuous(breaks = 1:21) +
+      labs(x = "Area", y = "Bias", title = "Avg. Area Bias for Validation Data", fill = "Model")
+
+```
+
+* Chaotic, but model bias varies significantly by area. Most areas are overpredicted.     
+* Prophet model has positive bias (over-prediction) for every area.  
+* ARIMA model over-predicts every area except area 6.   
+
+Let's look at area 6.
+
+```{r area_6_collisions_and_preds}
+
+# Look at data and preds for area 6
+  model_data %>% 
+    mutate(area = as.character(area)) %>% 
+    filter(area == 6 & month >= ymd("2018-05-01")) %>% 
+    left_join(select(all_preds, -c(collisions, m3_mape, m3_bias, m6_mape, m6_bias, arima_mape, arima_bias, prophet_mape, prophet_bias)), 
+              by = c("month", "area")) %>% 
+    rename(Actual = collisions, ARIMA = arima_pred, `3 Month MA` = m3_pred, `6 Month MA` = m6_pred, Prophet = prophet_pred) %>%
+    gather(cat, val, -c(month, area)) %>% 
+    mutate(cat = factor(cat, levels = c("3 Month MA", "6 Month MA", "ARIMA", "Prophet", "Actual"))) %>%
+  
+  ggplot(aes(x = month, y = val, group = cat, color = cat)) + 
+    geom_line() + geom_point() + 
+    scale_color_manual(values = c("#F8766D", "#7CAE00", "#00BFC4", "#C77CFF", "black")) +
+    expand_limits(y = 50) + 
+    scale_x_date(date_breaks = "1 month", date_labels = "%b-%y") + 
+    theme(axis.text.x = element_text(angle = 90)) +
+    labs(x = "", y = "", title = "Actual Collisions and Model Predictions for Area 6")
+
+```
+
+* The collision spikes in Oct 2018 and Mar 2019 cause the bias for most models to be negative (under-prediction).   
+
+<br>   
+
+Now, I'll look at the worst prediction (MAPE) for each model.   
+<br>   
+
+* 3 Month MA Model   
+
+```{r m3_worst}
+
+filter(all_preds, m3_mape == max(all_preds$m3_mape)) %>% 
+  select(-c(m3_pred, m6_pred, arima_pred, prophet_pred, m3_bias, m6_bias, arima_bias, prophet_bias))
+
+```
+
+* 6 Month MA Model   
+
+```{r m6_worst}
+
+filter(all_preds, m6_mape == max(all_preds$m6_mape)) %>% 
+  select(-c(m3_pred, m6_pred, arima_pred, prophet_pred, m3_bias, m6_bias, arima_bias, prophet_bias))
+
+```
+
+* ARIMA Model   
+
+```{r arima_worst}
+
+filter(all_preds, arima_mape == max(all_preds$arima_mape)) %>% 
+  select(-c(m3_pred, m6_pred, arima_pred, prophet_pred, m3_bias, m6_bias, arima_bias, prophet_bias))
+
+```
+
+* Prophet Model   
+
+```{r prophet_worst}
+
+filter(all_preds, prophet_mape == max(all_preds$prophet_mape)) %>% 
+  select(-c(m3_pred, m6_pred, arima_pred, prophet_pred, m3_bias, m6_bias, arima_bias, prophet_bias))
+
+```
+
+* Area 14 shows up twice as does the month of *2019-01-01*   
+* For the 6 month MA and ARIMA model's worst prediction, all models have poor performance.      
+* For the 3 month MA model's worst prediction, the Prophet model has a decent prediction.   
+* For the Prophet model's worst prediction, the 3 and 6 month MA models have much better performance.   
+
+Let's take a look at area 14.   
+
+```{r area_14_collisions_and_preds}
+
+# Look at data and preds for area 14
+  model_data %>% 
+    filter(area == 14 & month >= ymd("2018-05-01")) %>% 
+    left_join(select(all_preds, -c(collisions, m3_mape, m3_bias, m6_mape, m6_bias, arima_mape, arima_bias, prophet_mape, prophet_bias)), 
+              by = c("month", "area")) %>% 
+    rename(Actual = collisions, ARIMA = arima_pred, `3 Month MA` = m3_pred, `6 Month MA` = m6_pred, Prophet = prophet_pred) %>%
+    gather(cat, val, -c(month, area)) %>% 
+    mutate(cat = factor(cat, levels = c("3 Month MA", "6 Month MA", "ARIMA", "Prophet", "Actual"))) %>%
+  
+  ggplot(aes(x = month, y = val, group = cat, color = cat)) + 
+    geom_line() + geom_point() + 
+    scale_color_manual(values = c("#F8766D", "#7CAE00", "#00BFC4", "#C77CFF", "black")) +
+    expand_limits(y = 0) + 
+    scale_x_date(date_breaks = "1 month", date_labels = "%b-%y") + 
+    theme(axis.text.x = element_text(angle = 90)) +
+    labs(x = "", y = "", title = "Actual Collisions and Model Predictions for Area 14", color = "Model")
+
+```
+
+* The models really struggle with the drops in Sep 2018 and Feb 2019 as well as the jump in Jul 2019.   
+<br>   
+
+I'll do some initial work on daily modeling.
+
+```{r daily_modeling}
+
+all_daily_preds = read_csv("all_daily_preds.csv")
+
+all_daily_preds = mutate(all_daily_preds, 
+                                 date_occ = substr(as.character(all_daily_preds$date_occ), 1, 10), 
+                                 area = as.character(area))
+
+# Get data
+daily_data = data_clean %>% 
+              filter(date_occ < ymd("2019-08-01")) %>% 
+              group_by(date_occ, area) %>% summarize(collisions = n()) %>% ungroup()
+
+```
+
+```{r daily_modeling_results_area_2}
+
+# Look at data and preds for area 2
+daily_data %>% 
+  mutate(date_occ = as.character(date_occ)) %>%
+  filter(area == 2 & date_occ >= ymd("2019-07-01")) %>% 
+  left_join(select(all_daily_preds, -c(collisions, m3_mape, m3_bias, m6_mape, m6_bias, arima_mape, arima_bias, prophet_mape, prophet_bias)), 
+            by = c("date_occ", "area")) %>% 
+  rename(Actual = collisions, ARIMA = arima_pred, `3 Month MA` = m3_pred, `6 Month MA` = m6_pred, Prophet = prophet_pred) %>%
+  gather(cat, val, -c(date_occ, area)) %>% 
+  mutate(cat = factor(cat, levels = c("3 Month MA", "6 Month MA", "ARIMA", "Prophet", "Actual")), 
+         date_occ = ymd(date_occ)) %>%
+  
+  ggplot(aes(x = date_occ, y = val, group = cat, color = cat)) + 
+  geom_line() + geom_point() + 
+  scale_color_manual(values = c("#F8766D", "#7CAE00", "#00BFC4", "#C77CFF", "black")) +
+  expand_limits(y = 0) + 
+  labs(x = "", y = "", title = "Actual Collisions and Model Predictions for Area 2 (Daily Model)", color = "Model")
+
+```
+
+```{r daily_modeling_results}
+
+# Table of mean overall performance per model
+          all_daily_preds %>% summarize(mean_m3_mape = round(mean(m3_mape), 4), 
+                                    mean_m6_mape = round(mean(m6_mape), 4), 
+                                    mean_arima_mape = round(mean(arima_mape), 4),
+                                    mean_prophet_mape = round(mean(prophet_mape), 4), 
+                                    mean_m3_bias = round(mean(m3_bias), 4), 
+                                    mean_m6_bias = round(mean(m6_bias), 4),
+                                    mean_arima_bias = round(mean(arima_bias), 4),
+                                    mean_prophet_bias = round(mean(prophet_bias), 4)) %>% 
+            data.frame()
+
+```
+
+```{r daily_modeling_mape_per_month}
+
+# Average MAPE per model per month
+all_daily_preds %>% 
+  group_by(date_occ) %>% summarize(`3 Month MA` = mean(m3_mape), 
+                                `6 Month MA` = mean(m6_mape), 
+                                `ARIMA` = mean(arima_mape),
+                                Prophet = mean(prophet_mape)) %>% ungroup() %>%
+  gather(key = "model", value = "error", -date_occ) %>%
+  
+  ggplot(aes(x = date_occ, y = error, group = model, color = model)) + 
+  geom_line() + geom_point() +
+  expand_limits(y = 0) + 
+  theme(axis.text.x = element_text(angle = 90)) +
+  labs(x = "", y = "MAPE", title = "Avg. Daily MAPE for Validation Data", color = "Model")
+
+```
+
+```{r daily_modeling_bias_per_month}
+
+# Bias
+all_daily_preds %>% 
+  group_by(date_occ) %>% summarize(`3 Month MA` = mean(m3_bias), 
+                                `6 Month MA` = mean(m6_bias), 
+                                `ARIMA` = mean(arima_bias),
+                                Prophet = mean(prophet_bias)) %>% ungroup() %>%
+  gather(key = "model", value = "error", -date_occ) %>% 
+  
+  ggplot(aes(x = date_occ, y = error, group = model, color = model)) + 
+  geom_line() + geom_point() + 
+  theme(axis.text.x = element_text(angle = 90)) +
+  labs(x = "", y = "Bias", title = "Avg. Monthly Bias for Validation Data", color = "Model")
+
+```
+
+```{r daily_modeling_mape_per_area}
+
+# Average MAPE per model per area
+all_daily_preds %>% 
+  group_by(area) %>% summarize(`3 Month MA` = mean(m3_mape), 
+                               `6 Month MA` = mean(m6_mape), 
+                               `ARIMA` = mean(arima_mape),
+                               Prophet = mean(prophet_mape)) %>% ungroup() %>% 
+  gather(key = "model", value = "error", -area) %>%
+  
+  ggplot(aes(x = as.numeric(area), y = error, fill = model)) + 
+  geom_bar(position = "dodge", stat = "identity") + 
+  scale_x_continuous(breaks = 1:21) +
+  labs(x = "Area", y = "MAPE", title = "Avg. Area MAPE for Validation Data", fill = "Model")
+
+```
+
+```{r daily_modeling_per_area}
+
+# Average bias per model per area
+        all_daily_preds %>% 
+          group_by(area) %>% summarize(`3 Month MA` = mean(m3_bias), 
+                                       `6 Month MA` = mean(m6_bias), 
+                                       `ARIMA` = mean(arima_bias),
+                                       Prophet = mean(prophet_bias)) %>% ungroup() %>% 
+          gather(key = "model", value = "error", -area) %>%
+          
+          ggplot(aes(x = as.numeric(area), y = error, fill = model)) + 
+          geom_bar(position = "dodge", stat = "identity") + 
+          scale_x_continuous(breaks = 1:21) +
+          labs(x = "Area", y = "Bias", title = "Avg. Area Bias for Validation Data", fill = "Model")
+
+```
+
+#### Conclusions   
+
+* Overall model performance is not bad.   
+* However, the fact that MA models have the best performance indicates that including longer-term historical data, differencing, and including previous errors doesn't really help performance.   
+* This is a surprising result, but suggests that the number of collisions per month/area is largely random within a certain range.   
+* Trends seem to vary by area. This should in theory be addressed by the ARIMA and Prophet methods which fit a separate model per area.   
+
+<br>
+
+### Next Steps
+
+<br>
+This section lists next steps I would take to build on this analysis.   
+
+* Data Questions   
+    + "vict_age": How are multiple victims addressed? Why the large spike at 99 years old?   
+* Find a measure of number of vehicles on the road by time of day, gender, area, etc. This provides a measure of per capita collisions and would allow me to say whether a given time of day, day of week, etc was more dangerous than another.      
+* Modeling: 
+    + Try more approaches and parameter tuning.     
+    + Dig into a single area and see if model results can be improved.   
+    + Find a way to integrate external regressors.   
